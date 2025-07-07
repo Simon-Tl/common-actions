@@ -1,0 +1,284 @@
+name: Reusable ArgoCD Deploy Workflow
+
+on:
+  workflow_call:
+    inputs:
+      # 环境参数（必需）
+      environment:
+        description: 'Target Environment'
+        required: true
+        type: string
+      
+      # 可选的覆盖参数
+      registry:
+        description: 'Container registry URL'
+        required: false
+        type: string
+        default: 'acr.gradient.network'
+      
+      # Git 配置
+      git_user_email:
+        description: 'Git user email for commits'
+        required: false
+        type: string
+        default: 'ci@company.com'
+      git_user_name:
+        description: 'Git user name for commits'
+        required: false
+        type: string
+        default: 'CI Bot'
+      
+      # ArgoCD 参数
+      argocd_sync:
+        description: 'Trigger ArgoCD Sync'
+        required: false
+        type: boolean
+        default: true
+      argocd_timeout:
+        description: 'ArgoCD sync timeout in seconds'
+        required: false
+        type: number
+        default: 600
+      
+      # 构建参数
+      build_platforms:
+        description: 'Docker build platforms'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      build_args:
+        description: 'Docker build arguments (multiline string)'
+        required: false
+        type: string
+        default: ''
+    
+    secrets:
+      # 注册表认证
+      registry_username:
+        description: 'Container registry username'
+        required: true
+      registry_password:
+        description: 'Container registry password'
+        required: true
+      
+      # ArgoCD 认证
+      argocd_token:
+        description: 'ArgoCD authentication token'
+        required: true
+      argocd_server:
+        description: 'ArgoCD server URL'
+        required: true
+      
+      # 通知
+      slack_webhook_url:
+        description: 'Slack webhook URL for notifications'
+        required: false
+      
+      # GitHub token
+      github_token:
+        description: 'GitHub token for repository operations'
+        required: false
+
+# 固定的应用配置（在 common 仓库中定义）
+env:
+  REGISTRY: ${{ inputs.registry }}
+  NAMESPACE: ${{ inputs.environment }}
+  # 固定的路径配置
+  HELM_VALUES: helm/${{ inputs.environment }}-values.yaml
+  DOCKERFILE_PATH: ./docker/dashboard.Dockerfile
+  HELM_IMAGE_TAG_PATH: .system.imageTag
+  # 固定的应用配置
+  IMAGE_NAME: iaas-dashboard
+  NAME: iaas-dashboard
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      simple_tag: ${{ steps.simple-tag.outputs.tag }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.registry_username }}
+        password: ${{ secrets.registry_password }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.NAMESPACE }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=raw,value=${{ github.ref_name }}.{{date 'YYYYMMDDTHHMMSS'}}.{{sha}}
+        flavor: |
+          latest=false
+
+    - name: Extract simple tag
+      id: simple-tag
+      run: |
+        FULL_TAG="${{ steps.meta.outputs.tags }}"
+        SIMPLE_TAG=$(echo "$FULL_TAG" | sed 's|.*:||')
+        echo "tag=$SIMPLE_TAG" >> $GITHUB_OUTPUT
+        echo "Extracted simple tag: $SIMPLE_TAG"
+    
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./docker/dashboard.Dockerfile
+        platforms: linux/amd64 
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          ENV=${{ inputs.environment || 'test' }}
+          ${{ inputs.build_args }}
+
+  update-values:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    permissions:
+      contents: write    
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.github_token || secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+    
+    - name: Update Helm values
+      env:
+        NEW_TAG: ${{ needs.build-and-push.outputs.simple_tag }}
+      run: |
+        # 安装 yq
+        sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+        sudo chmod +x /usr/local/bin/yq
+        
+        cp "${{ env.HELM_VALUES }}" "${{ env.HELM_VALUES }}.backup"
+        
+        # 使用固定的 imageTag 路径
+        yq eval '${{ env.HELM_IMAGE_TAG_PATH }} = "'${NEW_TAG}'"' -i "${{ env.HELM_VALUES }}"
+        
+        # 验证更改
+        if grep -q "${NEW_TAG}" "${{ env.HELM_VALUES }}"; then
+          echo "✅ Successfully updated imageTag to ${NEW_TAG}"
+        else
+          echo "❌ Failed to update imageTag"
+          exit 1
+        fi
+        
+        # 提交更改
+        git config --local user.email "${{ inputs.git_user_email }}"
+        git config --local user.name "${{ inputs.git_user_name }}"
+        git add "${{ env.HELM_VALUES }}"
+        
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "chore(ci): update ${{ inputs.environment }} image tag to ${NEW_TAG}"
+          git push
+        fi
+
+  trigger-argocd:
+    needs: [build-and-push, update-values]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.argocd_sync }}
+    
+    steps:
+    - name: Install ArgoCD CLI
+      run: |
+        curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+        rm argocd-linux-amd64
+        argocd version --client
+    
+    - name: Trigger ArgoCD Application Sync
+      env:
+        ARGOCD_TOKEN: ${{ secrets.argocd_token }}
+        ARGOCD_SERVER: ${{ secrets.argocd_server }}
+        APP_NAME: ${{ inputs.environment }}-${{ env.NAME }}
+        IMAGE_TAG: ${{ needs.build-and-push.outputs.simple_tag }}
+        BRANCH: ${{ github.ref_name }}
+        ARGOCD_PARAMETER: "grpc-web"
+      run: |
+        # 验证连接
+        argocd app list --auth-token $ARGOCD_TOKEN --server $ARGOCD_SERVER --$ARGOCD_PARAMETER | head -5
+        
+        # 检查应用是否存在
+        if ! argocd app get $APP_NAME --auth-token $ARGOCD_TOKEN --server $ARGOCD_SERVER --$ARGOCD_PARAMETER > /dev/null 2>&1; then
+          echo "❌ ArgoCD application $APP_NAME not found"
+          exit 1
+        fi
+        
+        # 设置应用版本
+        echo "🔄 Setting application revision to $BRANCH"
+        argocd app set $APP_NAME --revision $BRANCH --auth-token $ARGOCD_TOKEN --server $ARGOCD_SERVER --$ARGOCD_PARAMETER
+        
+        # 同步应用
+        echo "🚀 Syncing application $APP_NAME"
+        argocd app sync $APP_NAME --prune --force --auth-token $ARGOCD_TOKEN --server $ARGOCD_SERVER --$ARGOCD_PARAMETER
+        
+        # 等待同步完成
+        echo "⏳ Waiting for sync to complete (timeout: ${{ inputs.argocd_timeout }} seconds)"
+        argocd app wait $APP_NAME --timeout ${{ inputs.argocd_timeout }} --auth-token $ARGOCD_TOKEN --server $ARGOCD_SERVER --$ARGOCD_PARAMETER
+        
+        echo "✅ ArgoCD application $APP_NAME synced successfully"
+
+  notify:
+    needs: [build-and-push, trigger-argocd]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Notify deployment status
+      env:
+        WEBHOOK_URL: ${{ secrets.slack_webhook_url }}
+        STATUS: ${{ needs.trigger-argocd.result }}
+        IMAGE_TAG: ${{ needs.build-and-push.outputs.simple_tag }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        # 构建详细的状态信息
+        BUILD_STATUS="${{ needs.build-and-push.result }}"
+        ARGOCD_STATUS="${{ needs.trigger-argocd.result }}"
+        
+        if [ "$STATUS" = "success" ]; then
+          EMOJI="✅"
+          STATUS_TEXT="deployment successful"
+        elif [ "$STATUS" = "failure" ]; then
+          EMOJI="❌"
+          STATUS_TEXT="deployment failed"
+        elif [ "$STATUS" = "cancelled" ]; then
+          EMOJI="⏹️"
+          STATUS_TEXT="deployment cancelled"
+        else
+          EMOJI="⚠️"
+          STATUS_TEXT="deployment status unknown"
+        fi
+        
+        MESSAGE="$EMOJI ${{ env.IMAGE_NAME }} $STATUS_TEXT\n"
+        MESSAGE="${MESSAGE}📦 Image: $IMAGE_TAG\n"
+        MESSAGE="${MESSAGE}🌍 Environment: $ENVIRONMENT\n"
+        MESSAGE="${MESSAGE}🔨 Build: $BUILD_STATUS\n"
+        MESSAGE="${MESSAGE}🚀 ArgoCD: $ARGOCD_STATUS\n"
+        MESSAGE="${MESSAGE}🔗 Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        
+        if [ -n "$WEBHOOK_URL" ]; then
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"$MESSAGE\"}" \
+            "$WEBHOOK_URL"
+        else
+          echo "⚠️ SLACK_WEBHOOK_URL not configured, skipping notification"
+        fi
