@@ -73,11 +73,6 @@ on:
       slack_webhook_url:
         description: 'Slack webhook URL for notifications'
         required: false
-      
-      # GitHub token
-      github_token:
-        description: 'GitHub token for repository operations'
-        required: false
 
 # 固定的应用配置（在 common 仓库中定义）
 env:
