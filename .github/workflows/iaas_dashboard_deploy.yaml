@@ -1,34 +1,15 @@
-name: Reusable ArgoCD Deploy Workflow
+name: Iaas ArgoCD Deploy Workflow
 
 on:
   workflow_call:
     inputs:
-      # 环境参数（必需）
+      # 核心必需参数
       environment:
         description: 'Target Environment'
         required: true
         type: string
       
-      # 可选的覆盖参数
-      registry:
-        description: 'Container registry URL'
-        required: false
-        type: string
-        default: 'acr.gradient.network'
-      
-      # Git 配置
-      git_user_email:
-        description: 'Git user email for commits'
-        required: false
-        type: string
-        default: 'ci@company.com'
-      git_user_name:
-        description: 'Git user name for commits'
-        required: false
-        type: string
-        default: 'CI Bot'
-      
-      # ArgoCD 参数
+      # 可选的业务参数
       argocd_sync:
         description: 'Trigger ArgoCD Sync'
         required: false
@@ -40,12 +21,7 @@ on:
         type: number
         default: 600
       
-      # 构建参数
-      build_platforms:
-        description: 'Docker build platforms'
-        required: false
-        type: string
-        default: 'linux/amd64'
+      # 可选的构建参数（如果真的需要灵活性）
       build_args:
         description: 'Docker build arguments (multiline string)'
         required: false
@@ -76,7 +52,8 @@ on:
 
 # 固定的应用配置（在 common 仓库中定义）
 env:
-  REGISTRY: ${{ inputs.registry }}
+  # 固定配置
+  REGISTRY: 'acr.gradient.network'
   NAMESPACE: ${{ inputs.environment }}
   # 固定的路径配置
   HELM_VALUES: helm/${{ inputs.environment }}-values.yaml
@@ -85,6 +62,11 @@ env:
   # 固定的应用配置
   IMAGE_NAME: iaas-dashboard
   NAME: iaas-dashboard
+  # 固定的 Git 配置
+  GIT_USER_EMAIL: 'ci@company.com'
+  GIT_USER_NAME: 'CI Bot'
+  # 固定的构建配置
+  BUILD_PLATFORMS: 'linux/amd64'
 
 jobs:
   build-and-push:
@@ -176,8 +158,8 @@ jobs:
         fi
         
         # 提交更改
-        git config --local user.email "${{ inputs.git_user_email }}"
-        git config --local user.name "${{ inputs.git_user_name }}"
+        git config user.email "${{ env.GIT_USER_EMAIL }}"
+        git config user.name "${{ env.GIT_USER_NAME }}"
         git add "${{ env.HELM_VALUES }}"
         
         if git diff --staged --quiet; then
